@@ -1,6 +1,6 @@
 import 'package:flutter/widgets.dart';
 
-import 'hotspot_notification.dart';
+import 'hotspot_provider.dart';
 
 /// Example of a page that has multiple hotspot targets.
 ///
@@ -75,6 +75,7 @@ class HotspotTarget extends StatefulWidget {
     required this.child,
     this.hotspotSize,
     this.hotspotOffset = Offset.zero,
+    this.enabled = true,
   }) : super(key: key);
 
   /// Combines multiple hotspot targets into a single group.
@@ -102,21 +103,77 @@ class HotspotTarget extends StatefulWidget {
   /// Override the hotspot center with a custom offset.
   final Offset hotspotOffset;
 
+  /// Whether this target takes part in hotspot flows.
+  ///
+  /// Toggling this keeps [child] and its state intact, unlike adding or
+  /// removing the [HotspotTarget] around it.
+  final bool enabled;
+
   @override
   HotspotTargetState createState() => HotspotTargetState();
 }
 
 class HotspotTargetState extends State<HotspotTarget> {
-  @override
-  void didChangeDependencies() {
-    HotspotNotification(target: this).dispatch(context);
-    super.didChangeDependencies();
+  HotspotProviderState? _provider;
+
+  /// False between deactivation and reactivation, and after disposal.
+  var _inTree = true;
+
+  /// Registers with the nearest [HotspotProvider], leaving the previous one
+  /// if this target was moved (GlobalKey) under a different provider.
+  void _attach() {
+    final provider = widget.enabled
+        ? context.findAncestorStateOfType<HotspotProviderState>()
+        : null;
+    if (provider != _provider) _provider?.detachTarget(this);
+    _provider = provider?..attachTarget(this);
   }
 
-  /// Convenience getter to find the global paint bounds of this [HotspotTarget]
-  Rect get globalPaintBounds =>
-      (context.findRenderObject() as RenderBox).paintBounds.shift(
-          (context.findRenderObject() as RenderBox).localToGlobal(Offset.zero));
+  @override
+  void initState() {
+    super.initState();
+    _attach();
+  }
+
+  @override
+  void didUpdateWidget(HotspotTarget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.enabled != widget.enabled) {
+      _attach();
+    } else if (oldWidget.flow != widget.flow ||
+        oldWidget.order != widget.order) {
+      _provider?.attachTarget(this);
+    }
+  }
+
+  @override
+  void activate() {
+    super.activate();
+    _inTree = true;
+    _attach();
+  }
+
+  @override
+  void deactivate() {
+    _inTree = false;
+    _provider?.detachTarget(this);
+    _provider = null;
+    super.deactivate();
+  }
+
+  /// The global paint bounds, or null when the target is not laid out in the
+  /// tree (e.g. it is being removed or has not been laid out yet).
+  Rect? get tryGlobalPaintBounds {
+    if (!_inTree) return null;
+    final box = context.findRenderObject();
+    if (box is! RenderBox || !box.attached || !box.hasSize) return null;
+    final bounds = box.paintBounds.shift(box.localToGlobal(Offset.zero));
+    return bounds.isFinite ? bounds : null;
+  }
+
+  /// The global paint bounds, or [Rect.zero] when unavailable.
+  /// Prefer [tryGlobalPaintBounds].
+  Rect get globalPaintBounds => tryGlobalPaintBounds ?? Rect.zero;
 
   @override
   Widget build(BuildContext context) {
@@ -124,6 +181,7 @@ class HotspotTargetState extends State<HotspotTarget> {
   }
 
   @override
-  String toString({DiagnosticLevel minLevel = DiagnosticLevel.info}) =>
-      'HotspotTargetState(flow: ${widget.flow}, order: ${widget.order}, mounted: $mounted)';
+  String toString({DiagnosticLevel minLevel = DiagnosticLevel.info}) => mounted
+      ? 'HotspotTargetState(flow: ${widget.flow}, order: ${widget.order}, inTree: $_inTree)'
+      : 'HotspotTargetState(disposed)';
 }

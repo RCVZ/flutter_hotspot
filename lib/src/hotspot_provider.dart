@@ -1,10 +1,11 @@
+import 'dart:math';
+
 import 'package:flutter/material.dart';
 import 'package:hotspot/hotspot.dart';
 import 'package:provider/provider.dart';
 
 import 'callout_layout_delegate.dart';
 import 'callout_tail_painter.dart';
-import 'hotspot_notification.dart';
 import 'hotspot_painter.dart';
 import 'paint_bounds_builder.dart';
 
@@ -154,6 +155,10 @@ class HotspotProvider extends StatefulWidget {
   static HotspotProviderState of(BuildContext context) =>
       Provider.of<HotspotProviderState>(context, listen: false);
 
+  /// The ancestor [HotspotProvider], or null when there is none.
+  static HotspotProviderState? maybeOf(BuildContext context) =>
+      context.findAncestorStateOfType<HotspotProviderState>();
+
   @override
   HotspotProviderState createState() => HotspotProviderState();
 }
@@ -163,11 +168,46 @@ class HotspotProviderState extends State<HotspotProvider>
   CalloutActionBuilder get actionBuilder =>
       widget.actionBuilder ?? (_, c) => HotspotActionBuilder(c);
 
-  final _targets = <HotspotTargetState>[];
+  /// Targets currently in the tree below this provider. Targets attach and
+  /// detach themselves, so this never holds a deactivated or disposed target.
+  final _targets = <HotspotTargetState>{};
 
-  var _flow = '';
-  var _index = 0;
+  var _flow = 'main';
+
+  /// Whether the overlay is shown (or fading in).
   var _visible = false;
+
+  /// The highlighted target. Kept while the overlay fades out, cleared after.
+  HotspotTargetState? _current;
+
+  var _syncScheduled = false;
+
+  /// Drives the overlay fade. When fully faded out, [_current] is cleared so a
+  /// hidden tour never measures its target.
+  late final AnimationController _fade;
+  late final CurvedAnimation _opacity;
+
+  @override
+  void initState() {
+    super.initState();
+    _fade = AnimationController(vsync: this, duration: widget.duration)
+      ..addStatusListener(_onFadeStatus);
+    _opacity = CurvedAnimation(parent: _fade, curve: widget.skrimCurve);
+  }
+
+  @override
+  void didUpdateWidget(HotspotProvider oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _fade.duration = widget.duration;
+    _opacity.curve = widget.skrimCurve;
+  }
+
+  @override
+  void dispose() {
+    _opacity.dispose();
+    _fade.dispose();
+    super.dispose();
+  }
 
   /// When we start the flow we save the last focus node, dismiss
   /// focus to close the keyboard, and after the tour is done we
@@ -179,77 +219,89 @@ class HotspotProviderState extends State<HotspotProvider>
       _targets.where((e) => e.widget.flow == _flow).toList()
         ..sort((a, b) => a.widget.order.compareTo(b.widget.order));
 
-  /// Initiate a hotspot flow
+  /// Initiate a hotspot flow.
   void startFlow([String flow = 'main']) {
-    /// Dismiss keyboard if open
-    _lastFocusNode = FocusManager.instance.primaryFocus;
-    _lastFocusNode?.unfocus();
-
-    _pruneUnmountedTargets();
-
-    setState(() {
-      _flow = flow;
-      _index = 0;
-
-      if (currentFlow.isEmpty) {
-        if (HotspotProvider.log) {
-          debugPrint('[Hotspot] warning, flow dispatched, '
-              'but no hotspots found. flow: $flow');
-        }
-      } else {
-        _visible = true;
-      }
-    });
+    _flow = flow;
+    final first = currentFlow.firstOrNull;
+    if (first == null && HotspotProvider.log) {
+      debugPrint('[Hotspot] warning, flow dispatched, '
+          'but no hotspots found. flow: $flow');
+    }
+    _show(first);
   }
 
   /// Called when tapping the next button.
   /// Can be called externally.
-  void next() {
-    _pruneUnmountedTargets();
-
-    if (_index + 1 < currentFlow.length) {
-      setState(() => _index++);
-    } else {
-      dismiss();
-    }
-  }
+  void next() => _step(1);
 
   /// Called when tapping the previous button.
   /// Can be called externally.
-  void previous() {
-    _pruneUnmountedTargets();
-
-    if (_index >= 1) {
-      setState(() => _index--);
-    } else {
-      dismiss();
-    }
-  }
+  void previous() => _step(-1);
 
   /// Called when tapping the dismiss button.
   /// Can be called externally.
-  void dismiss() {
-    _pruneUnmountedTargets();
+  void dismiss() => _show(null);
 
-    setState(() => _visible = false);
-
-    /// Put the focus back where it was if we
-    /// have a previously-saved focus node.
-    _lastFocusNode?.requestFocus();
-    _lastFocusNode = null;
-
-    /// don't animate to first tag on subsequent flow runs
-    Future.delayed(widget.duration, () => setState(() => _index = 0));
+  void _step(int delta) {
+    if (!_visible) return;
+    final flow = currentFlow;
+    final index = flow.indexOf(_current!);
+    final next = index + delta;
+    _show(index < 0 || next < 0 || next >= flow.length ? null : flow[next]);
   }
 
-  /// Removes all targets that are not mounted
-  void _pruneUnmountedTargets() =>
-      _targets.removeWhere((e) => e.mounted == false);
+  /// Shows [target], or hides the overlay when it is null.
+  void _show(HotspotTargetState? target) {
+    if (!mounted) return;
+    final wasVisible = _visible;
+    setState(() {
+      _visible = target != null;
+      // Keep the previous target for the fade-out, unless it left the flow.
+      if (target != null || !currentFlow.contains(_current)) _current = target;
+    });
+    _visible ? _fade.forward() : _fade.reverse();
 
-  /// Handle new targets as they become available
-  void _handleNewTarget(HotspotTargetState e) {
-    _targets.add(e);
-    _pruneUnmountedTargets();
+    if (!wasVisible && _visible) {
+      _lastFocusNode = FocusManager.instance.primaryFocus?..unfocus();
+    } else if (wasVisible && !_visible) {
+      final focus = _lastFocusNode;
+      _lastFocusNode = null;
+      if (focus?.context?.mounted ?? false) focus!.requestFocus();
+    }
+  }
+
+  /// Registers a [HotspotTarget]. Called by [HotspotTargetState].
+  void attachTarget(HotspotTargetState target) {
+    _targets.add(target);
+    _scheduleSync();
+  }
+
+  /// Unregisters a [HotspotTarget]. Called by [HotspotTargetState].
+  void detachTarget(HotspotTargetState target) {
+    _targets.remove(target);
+    _scheduleSync();
+  }
+
+  /// Targets attach and detach while the tree is building or being
+  /// finalized, when setState isn't allowed, so catch up after the frame.
+  void _scheduleSync() {
+    if (_current == null || _syncScheduled) return;
+    _syncScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _syncScheduled = false;
+      if (!mounted || _current == null) return;
+      if (currentFlow.contains(_current)) {
+        setState(() {}); // step index or count may have changed
+      } else {
+        dismiss();
+      }
+    });
+  }
+
+  void _onFadeStatus(AnimationStatus status) {
+    if (status == AnimationStatus.dismissed && mounted && _current != null) {
+      setState(() => _current = null);
+    }
   }
 
   Color get bg =>
@@ -260,57 +312,50 @@ class HotspotProviderState extends State<HotspotProvider>
 
   @override
   Widget build(BuildContext context) {
-    /// Update this index manually to transition between targets
-    final currentTarget = currentFlow.isEmpty ? null : currentFlow[_index];
+    final target = _current;
 
     return Provider<HotspotProviderState>(
       create: (_) => this,
       child: Material(
         child: Stack(
           children: [
-            NotificationListener<HotspotNotification>(
-              onNotification: (e) {
-                if (e.target.mounted) _handleNewTarget(e.target);
-                return true;
-              },
-              child: RepaintBoundary(
-                child: widget.child,
-              ),
+            RepaintBoundary(
+              child: widget.child,
             ),
             Positioned.fill(
               child: IgnorePointer(
-                ignoring: _visible == false,
-                child: AnimatedOpacity(
-                  opacity: _visible ? 1.0 : 0.0,
-                  curve: widget.skrimCurve,
-                  duration: widget.duration,
-                  child: () {
-                    if (currentTarget == null) {
-                      return Container();
-                    } else {
-                      return PaintBoundsBuilder(
-                        builder: (context, paintBounds) {
-                          final delegate = CalloutLayoutDelegate(
-                            tailSize: widget.tailSize,
-                            tailInsets: widget.tailInsets,
-                            paintBounds: paintBounds,
-                            targetBounds: currentTarget.globalPaintBounds,
-                            hotspotPadding: widget.padding,
-                            bodyMargin: widget.bodyMargin,
-                            bodyWidth: widget.bodyWidth,
-                            hotspotSize: currentTarget.widget.hotspotSize,
-                            hotspotOffset: currentTarget.widget.hotspotOffset,
-                          );
+                ignoring: !_visible,
+                child: FadeTransition(
+                  opacity: _opacity,
+                  child: target == null
+                      ? const SizedBox.shrink()
+                      : PaintBoundsBuilder(
+                          builder: (context, paintBounds) {
+                            // Measured during build, so the target may have
+                            // left the tree earlier in this frame.
+                            final targetBounds = target.tryGlobalPaintBounds;
+                            if (targetBounds == null) {
+                              return const SizedBox.shrink();
+                            }
+                            final delegate = CalloutLayoutDelegate(
+                              tailSize: widget.tailSize,
+                              tailInsets: widget.tailInsets,
+                              paintBounds: paintBounds,
+                              targetBounds: targetBounds,
+                              hotspotPadding: widget.padding,
+                              bodyMargin: widget.bodyMargin,
+                              bodyWidth: widget.bodyWidth,
+                              hotspotSize: target.widget.hotspotSize,
+                              hotspotOffset: target.widget.hotspotOffset,
+                            );
 
-                          return buildHotspotAndCallout(
-                            context: context,
-                            delegate: delegate,
-                            currentTarget: currentTarget,
-                          );
-                        },
-                      );
-                    }
-                  }(),
+                            return buildHotspotAndCallout(
+                              context: context,
+                              delegate: delegate,
+                              currentTarget: target,
+                            );
+                          },
+                        ),
                 ),
               ),
             ),
@@ -326,6 +371,9 @@ class HotspotProviderState extends State<HotspotProvider>
     required CalloutLayoutDelegate delegate,
     required HotspotTargetState currentTarget,
   }) {
+    // Animation builders can outlive the target element during this frame.
+    final targetWidget = currentTarget.widget;
+    final flow = currentFlow;
     return Stack(
       children: [
         /// Skrim with hotspot cutout
@@ -410,7 +458,7 @@ class HotspotProviderState extends State<HotspotProvider>
                                   duration: widget.duration,
                                   alignment: Alignment.topCenter,
                                   curve: widget.curve,
-                                  child: currentTarget.widget.calloutBody,
+                                  child: targetWidget.calloutBody,
                                 ),
                               ),
 
@@ -421,8 +469,8 @@ class HotspotProviderState extends State<HotspotProvider>
                                   dismiss: dismiss,
                                   next: next,
                                   previous: previous,
-                                  index: _index,
-                                  pages: currentFlow.length,
+                                  index: max(0, flow.indexOf(currentTarget)),
+                                  pages: flow.length,
                                   foregroundColor: fg,
                                 ),
                               ),
